@@ -1,0 +1,11 @@
+{
+  "name": "skyhook",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspace=packages/proxy"
+  }
+}
