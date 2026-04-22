@@ -1,21 +1,21 @@
 # Skyhook
 
-**Reverse call flow proxy for MCP servers behind network partitions.**
+**Reverse call flow proxy for MCP servers behind network partitions, fronted by AWS Bedrock AgentCore Gateway.**
 
-Skyhook lets an MCP server that can't accept inbound connections serve clients as if it could. The server connects *out* to a lightweight proxy, and clients connect to the proxy using standard HTTP Streamable Transport — no DNS changes, no firewall rules, no VPN.
+Skyhook lets an MCP server that can't accept inbound connections serve clients as if it could. The local server connects *out* to a lightweight proxy, and on connect it registers itself as a target of AWS Bedrock **AgentCore Gateway**. Clients talk to the gateway over its bidirectional MCP transport (WebSocket / streamable HTTP — no SSE); the gateway forwards to the Skyhook proxy, which tunnels requests down the existing WebSocket to the local server.
 
 ```
-┌─────────────────────┐          ┌─────────────────────┐          ┌─────────────────────┐
-│                     │          │                     │          │                     │
-│     MCP Client      │──HTTP───▶│   Skyhook Proxy     │◀──WS────│    MCP Server       │
-│                     │          │   (Fargate + ALB)    │          │   (behind firewall) │
-│                     │◀─HTTP───│                     │───WS───▶│                     │
-│                     │          │                     │          │                     │
-└─────────────────────┘          └─────────────────────┘          └─────────────────────┘
-      Your network                    AWS (shared)                  Partitioned network
+┌──────────────┐    WS /       ┌───────────────────┐   HTTPS bidi    ┌──────────────┐     WS      ┌──────────────┐
+│              │   streamable  │                   │   (no SSE)      │              │             │              │
+│  MCP Client  │──────────────▶│ AgentCore Gateway │────────────────▶│ Skyhook Proxy│────────────▶│  MCP Server  │
+│              │◀──────────────│ (AWS-managed MCP) │◀────────────────│  (Fargate)   │◀────────────│ (partitioned)│
+│              │               │                   │                 │              │             │              │
+└──────────────┘               └───────────────────┘                 └──────────────┘             └──────────────┘
+   Your network                       AWS Bedrock                       AWS VPC                    Partitioned
+                                                                                                    network
 ```
 
-The proxy is multi-tenant — one deployment serves any number of MCP servers, each identified by a `serverId`.
+The proxy is multi-tenant — one deployment serves any number of MCP servers, each identified by a `serverId` and exposed through the shared AgentCore Gateway as an independent MCP target.
 
 ---
 
@@ -46,11 +46,12 @@ await server.connect(transport);
 app.listen(3000);
 ```
 
-**Skyhook MCP server** — connects outbound through a proxy:
+**Skyhook MCP server** — connects outbound through a proxy and auto-registers with AgentCore Gateway:
 
 ```typescript
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SkyhookTransport } from "./skyhook-transport.js";
+import { registerWithAgentCore } from "./agentcore.js";
 
 // 1. Define your server and tools (exactly the same!)
 const server = new McpServer({ name: "my-server", version: "1.0.0" });
@@ -59,15 +60,30 @@ server.tool("echo", { text: z.string() }, async ({ text }) => ({
   content: [{ type: "text", text }],
 }));
 
-// 2. Connect via Skyhook (no Express, no inbound access needed)
+// 2. Connect via Skyhook and register the proxy endpoint
+//    with AgentCore Gateway as an MCP target.
 const transport = new SkyhookTransport({
   proxyUrl: "ws://your-proxy-alb-dns",
   serverId: "my-server",
+  onConnected: async () => {
+    await registerWithAgentCore({
+      serverId: "my-server",
+      proxyBaseUrl: "http://your-proxy-alb-dns",
+      name: "My Server",
+      gatewayRoleArn: process.env.AGENTCORE_GATEWAY_ROLE_ARN!,
+      authorizerConfiguration: {
+        customJWTAuthorizer: {
+          discoveryUrl: process.env.AGENTCORE_JWT_DISCOVERY_URL!,
+          allowedAudience: [process.env.AGENTCORE_JWT_ALLOWED_AUDIENCE!],
+        },
+      },
+    });
+  },
 });
 await server.connect(transport);
 ```
 
-That's it. No Express server. No inbound ports. No firewall rules. Your tools, resources, prompts, and `_meta.resourceUI` metadata all work unchanged — the proxy relays MCP messages byte-for-byte without inspecting them.
+That's it. No Express server. No inbound ports. No firewall rules. Your tools, resources, prompts, and `_meta.resourceUI` metadata all work unchanged — the gateway and proxy relay MCP messages byte-for-byte without inspecting them.
 
 ---
 
@@ -83,7 +99,9 @@ That's it. No Express server. No inbound ports. No firewall rules. Your tools, r
 | Network direction | Client → Server (inbound) | Server → Proxy (outbound) |
 | Express/HTTP server | Required | Not needed |
 | Inbound ports | Must be open | None |
-| Client URL | `http://your-server/mcp` | `http://proxy-alb/mcp/your-server-id` |
+| Client URL | `http://your-server/mcp` | AgentCore Gateway URL (e.g. `https://<gw-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp`) |
+| Client transport | HTTP + SSE | WebSocket / Streamable HTTP (bidirectional, no SSE) |
+| Discovery | Manual | Auto-registered with AgentCore Gateway on connect |
 
 ---
 
@@ -174,44 +192,41 @@ You should see:
 
 ### Step 5: Verify
 
-From any machine with network access to the ALB:
+The server logs the AgentCore Gateway URL it registered with on startup — that's the URL your clients use.
+
+Verify the proxy is healthy and has your server connected:
 
 ```bash
-# Initialize the MCP session
-curl -s -X POST \
-  http://skyhook-123456789.us-east-1.elb.amazonaws.com/mcp/my-server \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}' | jq
-
-# Call a tool
-curl -s -X POST \
-  http://skyhook-123456789.us-east-1.elb.amazonaws.com/mcp/my-server \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"text":"hello from the other side"}},"id":2}' | jq
+curl -s http://skyhook-123456789.us-east-1.elb.amazonaws.com/health | jq
+# → { "status": "ok", "servers": ["my-server"] }
 ```
 
-### Step 6: Register with AgentCore Gateway (optional)
+Then send an MCP request to the **gateway** (not the proxy directly):
 
-If you're using AWS AgentCore, register your proxy endpoint so agents can discover your server:
+```bash
+# Replace with the gatewayUrl printed by the server on startup.
+GATEWAY_URL="https://<gw-id>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+TOKEN="$(./get-jwt.sh)"   # JWT from whatever IdP your authorizer trusts
 
-```typescript
-import { SkyhookTransport } from "./skyhook-transport.js";
-
-const transport = new SkyhookTransport({
-  proxyUrl: process.env.PROXY_URL!,
-  serverId: "my-server",
-  onConnected: async () => {
-    // Register the proxy's HTTP endpoint with AgentCore
-    const endpointUrl = process.env.PROXY_URL!
-      .replace(/^ws/, "http") + "/mcp/my-server";
-
-    // Your AgentCore registration call here
-    await registerWithAgentCore({ endpointUrl, ... });
-  },
-});
+curl -s -X POST "$GATEWAY_URL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"text":"hello"}},"id":1}' | jq
 ```
 
-The `onConnected` callback fires every time the WebSocket connection is established (including reconnects), so your registration stays current.
+For fully bidirectional clients (notifications, server-initiated streams) use the WebSocket MCP transport that the Gateway exposes — the gateway multiplexes requests/notifications over a single socket rather than falling back to SSE.
+
+### Step 6: (Optional) Hit the proxy directly, bypassing the gateway
+
+For local debugging you can connect straight to the proxy's WebSocket MCP endpoint:
+
+```bash
+wscat -c ws://localhost:3000/mcp-ws/my-server
+> {"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}},"id":1}
+< {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"hi"}]},"id":1}
+```
+
+The proxy also accepts one-shot `POST /mcp/<serverId>` for simple request/response (this is the endpoint AgentCore Gateway uses as its MCP target).
 
 ---
 
@@ -374,86 +389,80 @@ After `cdk deploy`, the following resources exist in your AWS account:
 
 ### Registration Flow
 
-When an MCP server starts, it connects to the proxy and optionally registers with AgentCore Gateway:
+When an MCP server starts, it connects to the proxy and registers with AgentCore Gateway using the AWS SDK:
 
 ```
-  MCP Server                      Skyhook Proxy                  AgentCore Gateway
-      │                                │                                │
-      │  1. WebSocket UPGRADE          │                                │
-      │    GET /register/my-server     │                                │
-      │───────────────────────────────▶│                                │
-      │                                │                                │
-      │  2. 101 Switching Protocols    │                                │
-      │◀───────────────────────────────│                                │
-      │                                │                                │
-      │       WebSocket connected      │                                │
-      │◀══════════════════════════════▶│                                │
-      │                                │                                │
-      │  3. Register endpoint URL      │                                │
-      │    with AgentCore Gateway      │                                │
-      │────────────────────────────────────────────────────────────────▶│
-      │    "my server is reachable at  │                                │
-      │     http://alb-dns/mcp/my-server"                               │
-      │                                │                                │
-      │  4. Registration confirmed     │                                │
-      │◀────────────────────────────────────────────────────────────────│
-      │                                │                                │
-      │  ┌──────────────────────┐      │                                │
-      │  │ Proxy sends PING     │      │                                │
-      │  │ every 30s to keep    │      │                                │
-      │  │ connection alive     │      │                                │
-      │  └──────────────────────┘      │                                │
-      │                                │                                │
+  MCP Server                Skyhook Proxy        AgentCore Gateway (AWS)
+      │                          │                          │
+      │ 1. WebSocket UPGRADE     │                          │
+      │    /register/my-server   │                          │
+      │─────────────────────────▶│                          │
+      │                          │                          │
+      │ 2. 101 Switching         │                          │
+      │◀─────────────────────────│                          │
+      │                          │                          │
+      │ 3. ListGateways(name=skyhook-gateway)               │
+      │─────────────────────────────────────────────────────▶│
+      │    (CreateGateway if missing)                        │
+      │◀─────────────────────────────────────────────────────│
+      │                          │                          │
+      │ 4. CreateGatewayTarget                               │
+      │    { targetConfiguration.mcp.mcpServer.endpoint:     │
+      │      http://proxy-alb/mcp/my-server }                │
+      │─────────────────────────────────────────────────────▶│
+      │                          │                          │
+      │ 5. Target ready — gateway will forward client        │
+      │    MCP traffic to the proxy endpoint over a          │
+      │    bidirectional HTTPS stream (no SSE).              │
+      │◀─────────────────────────────────────────────────────│
+      │                          │                          │
+      │  ┌──────────────────────┐│                          │
+      │  │ Proxy sends PING     ││                          │
+      │  │ every 30s to keep    ││                          │
+      │  │ the tunnel alive     ││                          │
+      │  └──────────────────────┘│                          │
 ```
 
-The proxy holds the WebSocket open. The server appears in the `/health` endpoint and is ready to receive requests.
+After registration clients connect to the `gatewayUrl` returned by `CreateGateway`, not to the proxy ALB.
 
 ### Call Flow
 
-When an MCP client sends a request, the proxy relays it to the server over the existing WebSocket:
+When an MCP client sends a request, it goes through the gateway, then the proxy, then the WebSocket tunnel to the server:
 
 ```
-  MCP Client                      Skyhook Proxy                    MCP Server
-      │                                │                                │
-      │  1. POST /mcp/my-server        │                                │
-      │    { jsonrpc: "2.0",           │                                │
-      │      method: "tools/call",     │                                │
-      │      params: { name: "echo",   │                                │
-      │        arguments: { text: "hi" }│                               │
-      │      }, id: 1 }                │                                │
-      │───────────────────────────────▶│                                │
-      │                                │                                │
-      │                                │  2. WebSocket message          │
-      │                                │    { correlationId: "abc-123", │
-      │                                │      type: "request",          │
-      │                                │      body: <original request> }│
-      │                                │───────────────────────────────▶│
-      │                                │                                │
-      │                                │                                │  3. MCP server
-      │                                │                                │     processes
-      │                                │                                │     request
-      │                                │                                │
-      │                                │  4. WebSocket message          │
-      │                                │    { correlationId: "abc-123", │
-      │                                │      type: "response",         │
-      │                                │      body: <MCP response> }    │
-      │                                │◀───────────────────────────────│
-      │                                │                                │
-      │  5. HTTP 200                   │                                │
-      │    { jsonrpc: "2.0",           │                                │
-      │      result: {                 │                                │
-      │        content: [{ type: "text",│                               │
-      │          text: "hi" }],        │                                │
-      │        _meta: { resourceUI:    │                                │
-      │          { title: "Echo" }}     │                                │
-      │      }, id: 1 }               │                                │
-      │◀───────────────────────────────│                                │
-      │                                │                                │
+  MCP Client         AgentCore Gateway        Skyhook Proxy           MCP Server
+      │                     │                       │                      │
+      │ 1. MCP frame        │                       │                      │
+      │    over WS /        │                       │                      │
+      │    streamable HTTP  │                       │                      │
+      │    (no SSE)         │                       │                      │
+      │────────────────────▶│                       │                      │
+      │                     │                       │                      │
+      │                     │ 2. Forward to target  │                      │
+      │                     │    POST /mcp/my-server│                      │
+      │                     │    (bidirectional     │                      │
+      │                     │     HTTPS stream)     │                      │
+      │                     │──────────────────────▶│                      │
+      │                     │                       │                      │
+      │                     │                       │ 3. WS message        │
+      │                     │                       │ { correlationId,     │
+      │                     │                       │   type:"request",    │
+      │                     │                       │   body }             │
+      │                     │                       │─────────────────────▶│
+      │                     │                       │                      │
+      │                     │                       │ 4. WS response       │
+      │                     │                       │◀─────────────────────│
+      │                     │                       │                      │
+      │                     │ 5. HTTP response body │                      │
+      │                     │◀──────────────────────│                      │
+      │                     │                       │                      │
+      │ 6. MCP frame        │                       │                      │
+      │◀────────────────────│                       │                      │
 ```
 
-The proxy never inspects or modifies MCP message content. Fields like `_meta.resourceUI` pass through byte-for-byte.
+Neither the gateway nor the proxy inspects MCP payloads. `_meta.resourceUI` and other fields pass through byte-for-byte.
 
-**Latency overhead:** ~10-20ms (in-memory correlation, no external state store).
+**Latency overhead:** ~20-40ms (gateway hop + in-memory proxy correlation, no external state store).
 
 ### Failure Cases
 
@@ -565,4 +574,4 @@ This is the one file you need to add to your MCP server project. It:
 - Manages the WebSocket connection to the Skyhook proxy
 - Handles automatic reconnection with exponential backoff + jitter
 - Correlates JSON-RPC request/response IDs to proxy correlation IDs
-- Forwards unsolicited notifications via the proxy's SSE broadcast
+- Forwards unsolicited notifications over the proxy's client WebSocket fan-out (no SSE)

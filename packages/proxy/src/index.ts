@@ -30,7 +30,11 @@ interface ProxyResponse {
 
 interface ServerConnection {
   ws: WebSocket;
-  sseClients: Set<express.Response>;
+  /**
+   * WebSocket client sockets subscribed for server-initiated notifications.
+   * Replaces the old SSE broadcast — provides full bidirectional streaming.
+   */
+  clientSockets: Set<WebSocket>;
 }
 
 export interface ProxyOptions {
@@ -72,7 +76,12 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
     res.json({ status: "ok", servers: Array.from(servers.keys()) });
   });
 
-  // HTTP Streamable Transport — client sends MCP request
+  // MCP Streamable HTTP entry point.
+  //
+  // AgentCore Gateway (or any MCP client) posts a JSON-RPC message here.
+  // The response is returned as a streamed JSON body (chunked HTTP) rather
+  // than SSE — AgentCore Gateway will in turn stream it to its own clients
+  // over its bidirectional MCP transport.
   app.post("/mcp/:serverId", (req, res) => {
     const { serverId } = req.params;
     const conn = servers.get(serverId);
@@ -156,29 +165,6 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
     }
   });
 
-  // SSE endpoint — server-initiated notifications
-  app.get("/mcp/:serverId", (req, res) => {
-    const { serverId } = req.params;
-    const conn = servers.get(serverId);
-
-    if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
-      res.status(503).json({ error: "Server not connected", serverId });
-      return;
-    }
-
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    });
-    res.flushHeaders();
-
-    conn.sseClients.add(res);
-    req.on("close", () => {
-      conn.sseClients.delete(res);
-    });
-  });
-
   // DELETE — session termination
   app.delete("/mcp/:serverId", (req, res) => {
     const { serverId } = req.params;
@@ -205,22 +191,37 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
 
   // HTTP + WebSocket server
   const httpServer = createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+
+  // Two separate WS namespaces:
+  //   /register/:serverId  — upstream MCP servers connect here
+  //   /mcp-ws/:serverId    — downstream clients (or AgentCore Gateway edge)
+  //                          connect here for bidirectional MCP streaming
+  const registerWss = new WebSocketServer({ noServer: true });
+  const clientWss = new WebSocketServer({ noServer: true });
 
   httpServer.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-    const match = url.pathname.match(/^\/register\/([^/]+)$/);
 
-    if (!match) {
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-      socket.destroy();
+    const registerMatch = url.pathname.match(/^\/register\/([^/]+)$/);
+    if (registerMatch) {
+      const serverId = decodeURIComponent(registerMatch[1]);
+      registerWss.handleUpgrade(req, socket, head, (ws) => {
+        setupServerConnection(serverId, ws);
+      });
       return;
     }
 
-    const serverId = decodeURIComponent(match[1]);
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      setupServerConnection(serverId, ws);
-    });
+    const clientMatch = url.pathname.match(/^\/mcp-ws\/([^/]+)$/);
+    if (clientMatch) {
+      const serverId = decodeURIComponent(clientMatch[1]);
+      clientWss.handleUpgrade(req, socket, head, (ws) => {
+        setupClientConnection(serverId, ws);
+      });
+      return;
+    }
+
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
   });
 
   function setupServerConnection(serverId: string, ws: WebSocket): void {
@@ -230,7 +231,7 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
       rejectPendingForServer(serverId, "Server reconnected");
     }
 
-    const conn: ServerConnection = { ws, sseClients: new Set() };
+    const conn: ServerConnection = { ws, clientSockets: new Set() };
     servers.set(serverId, conn);
     console.log(`[skyhook] Server registered: ${serverId}`);
 
@@ -270,11 +271,17 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
           });
         }
       } else if (msg.type === "notification") {
-        for (const sseRes of conn.sseClients) {
-          try {
-            sseRes.write(`data: ${JSON.stringify(msg.body)}\n\n`);
-          } catch {
-            conn.sseClients.delete(sseRes);
+        // Fan out to any connected client WebSockets for this server.
+        const payload = JSON.stringify(msg.body);
+        for (const clientWs of conn.clientSockets) {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            try {
+              clientWs.send(payload);
+            } catch {
+              conn.clientSockets.delete(clientWs);
+            }
+          } else {
+            conn.clientSockets.delete(clientWs);
           }
         }
       }
@@ -285,13 +292,14 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
       clearInterval(interval);
       servers.delete(serverId);
       rejectPendingForServer(serverId, "Server disconnected");
-      for (const sseRes of conn.sseClients) {
+      for (const clientWs of conn.clientSockets) {
         try {
-          sseRes.end();
+          clientWs.close(1001, "Upstream server disconnected");
         } catch {
           // ignore
         }
       }
+      conn.clientSockets.clear();
     });
 
     ws.on("error", (err) => {
@@ -299,6 +307,111 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
         `[skyhook] WebSocket error for ${serverId}:`,
         err.message,
       );
+    });
+  }
+
+  function setupClientConnection(serverId: string, ws: WebSocket): void {
+    const conn = servers.get(serverId);
+    if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
+      ws.close(1011, `Server not connected: ${serverId}`);
+      return;
+    }
+
+    conn.clientSockets.add(ws);
+    console.log(`[skyhook] Client WebSocket attached to ${serverId}`);
+
+    const clientCorrelations = new Set<string>();
+
+    ws.on("message", (data) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data.toString());
+      } catch {
+        ws.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32700, message: "Parse error" },
+          }),
+        );
+        return;
+      }
+
+      // Each client frame is a single JSON-RPC message. Forward it to the
+      // upstream server and stream the response back on the same socket.
+      const correlationId = randomUUID();
+      clientCorrelations.add(correlationId);
+
+      const timer = setTimeout(() => {
+        pending.delete(correlationId);
+        serverPending.get(serverId)?.delete(correlationId);
+        clientCorrelations.delete(correlationId);
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32001, message: "Request timeout" },
+              id: (parsed as { id?: unknown })?.id ?? null,
+            }),
+          );
+        }
+      }, requestTimeoutMs);
+
+      if (!serverPending.has(serverId)) serverPending.set(serverId, new Set());
+      serverPending.get(serverId)!.add(correlationId);
+
+      pending.set(correlationId, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          pending.delete(correlationId);
+          serverPending.get(serverId)?.delete(correlationId);
+          clientCorrelations.delete(correlationId);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(response.body));
+          }
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          pending.delete(correlationId);
+          serverPending.get(serverId)?.delete(correlationId);
+          clientCorrelations.delete(correlationId);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32002, message: err.message },
+                id: (parsed as { id?: unknown })?.id ?? null,
+              }),
+            );
+          }
+        },
+        timer,
+      });
+
+      try {
+        conn.ws.send(
+          JSON.stringify({
+            correlationId,
+            type: "request",
+            body: parsed,
+          } satisfies ProxyMessage),
+        );
+      } catch {
+        const p = pending.get(correlationId);
+        p?.reject(new Error("Failed to send to upstream server"));
+      }
+    });
+
+    ws.on("close", () => {
+      conn.clientSockets.delete(ws);
+      for (const cid of clientCorrelations) {
+        const p = pending.get(cid);
+        if (p) p.reject(new Error("Client disconnected"));
+      }
+      clientCorrelations.clear();
+    });
+
+    ws.on("error", () => {
+      /* close handler cleans up */
     });
   }
 
@@ -330,6 +443,13 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
       new Promise<void>((resolve, reject) => {
         for (const [, conn] of servers) {
           conn.ws.close(1000, "Proxy shutting down");
+          for (const clientWs of conn.clientSockets) {
+            try {
+              clientWs.close(1001, "Proxy shutting down");
+            } catch {
+              // ignore
+            }
+          }
         }
         for (const [, p] of pending) {
           clearTimeout(p.timer);
@@ -338,8 +458,10 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
         pending.clear();
         servers.clear();
         serverPending.clear();
-        wss.close(() => {
-          httpServer.close((err) => (err ? reject(err) : resolve()));
+        registerWss.close(() => {
+          clientWss.close(() => {
+            httpServer.close((err) => (err ? reject(err) : resolve()));
+          });
         });
       }),
   };

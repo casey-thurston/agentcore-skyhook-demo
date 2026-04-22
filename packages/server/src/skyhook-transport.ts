@@ -109,7 +109,7 @@ export class SkyhookTransport implements Transport {
     }
 
     // No correlationId — this is an unsolicited notification (e.g. logging).
-    // Send as a notification so the proxy can broadcast via SSE.
+    // The proxy fans this out to any WebSocket clients attached to /mcp-ws/:serverId.
     this.ws.send(
       JSON.stringify({
         correlationId: randomUUID(),

@@ -289,4 +289,68 @@ describe("Skyhook Proxy", () => {
     expect(body.servers).toContain("alpha");
     expect(body.servers).toContain("beta");
   });
+
+  // Bidirectional WebSocket client endpoint (replaces SSE)
+  it("should relay requests and notifications over /mcp-ws/<serverId>", async () => {
+    const proxy = await startProxy();
+
+    const mock = await connectMockServer(proxy.wsUrl, "ws-server", (msg) => {
+      if (msg.type === "request") {
+        return {
+          correlationId: msg.correlationId,
+          type: "response",
+          body: { jsonrpc: "2.0", result: { echoed: (msg.body as any).id }, id: (msg.body as any).id },
+        };
+      }
+      return undefined;
+    });
+
+    const client = new WebSocket(`${proxy.wsUrl}/mcp-ws/ws-server`);
+    await new Promise<void>((resolve, reject) => {
+      client.on("open", resolve);
+      client.on("error", reject);
+    });
+
+    const recv: any[] = [];
+    client.on("message", (data) => recv.push(JSON.parse(data.toString())));
+
+    client.send(JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }));
+    client.send(JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 2 }));
+
+    // Wait for the two responses
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Now send a notification from the server side and make sure it arrives
+    mock.ws.send(
+      JSON.stringify({
+        correlationId: "notif-1",
+        type: "notification",
+        body: { jsonrpc: "2.0", method: "notifications/message", params: { text: "hi" } },
+      }),
+    );
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    const responseIds = recv
+      .filter((m) => m.result)
+      .map((m) => m.id)
+      .sort();
+    expect(responseIds).toEqual([1, 2]);
+
+    const notifs = recv.filter((m) => m.method === "notifications/message");
+    expect(notifs.length).toBe(1);
+    expect(notifs[0].params.text).toBe("hi");
+
+    client.close();
+  });
+
+  it("should close /mcp-ws/<serverId> when the upstream server is not connected", async () => {
+    const proxy = await startProxy();
+    const client = new WebSocket(`${proxy.wsUrl}/mcp-ws/unknown`);
+    const closeCode = await new Promise<number>((resolve, reject) => {
+      client.on("close", (code) => resolve(code));
+      client.on("error", reject);
+    });
+    expect(closeCode).toBe(1011);
+  });
 });
