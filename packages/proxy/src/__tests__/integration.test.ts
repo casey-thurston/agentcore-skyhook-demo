@@ -353,4 +353,135 @@ describe("Skyhook Proxy", () => {
     });
     expect(closeCode).toBe(1011);
   });
+
+  // Streamed POST: multi-frame exchange over a single chunked HTTP response
+  it("should stream multiple frames per exchange over POST as NDJSON", async () => {
+    const proxy = await startProxy();
+
+    await connectMockServer(proxy.wsUrl, "stream-server", (msg) => {
+      if (msg.type === "request") {
+        const ws = (msg as any)._ws;
+        // Mock server returns a sequence: progress, progress, response.
+        const correlationId = msg.correlationId;
+        // Return undefined; we'll send manually below via the open ws.
+        return undefined;
+      }
+    });
+
+    // The connectMockServer helper doesn't let us easily access the ws to
+    // manually push intermediate frames. Re-open a raw WS so we have control.
+    const ws = new WebSocket(`${proxy.wsUrl}/register/stream-2`);
+    await new Promise<void>((r, j) => {
+      ws.on("open", () => r());
+      ws.on("error", j);
+    });
+
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === "request") {
+        // Send two intermediate stream frames, then the final response.
+        ws.send(
+          JSON.stringify({
+            correlationId: msg.correlationId,
+            type: "stream",
+            final: false,
+            body: { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 0.25 } },
+          }),
+        );
+        ws.send(
+          JSON.stringify({
+            correlationId: msg.correlationId,
+            type: "stream",
+            final: false,
+            body: { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 0.75 } },
+          }),
+        );
+        ws.send(
+          JSON.stringify({
+            correlationId: msg.correlationId,
+            type: "response",
+            final: true,
+            body: { jsonrpc: "2.0", result: { ok: true }, id: msg.body.id },
+          }),
+        );
+      }
+    });
+
+    const res = await fetch(`${proxy.url}/mcp/stream-2`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 1 }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/x-ndjson/);
+
+    const text = await res.text();
+    const lines = text.trim().split("\n");
+    expect(lines.length).toBe(3);
+
+    const frames = lines.map((l) => JSON.parse(l));
+    expect(frames[0].method).toBe("notifications/progress");
+    expect(frames[0].params.progress).toBe(0.25);
+    expect(frames[1].method).toBe("notifications/progress");
+    expect(frames[1].params.progress).toBe(0.75);
+    expect(frames[2].result.ok).toBe(true);
+    expect(frames[2].id).toBe(1);
+
+    ws.close();
+  });
+
+  // Streamed WS client: multi-frame exchange over the bidirectional socket
+  it("should stream multiple frames per exchange over /mcp-ws/<serverId>", async () => {
+    const proxy = await startProxy();
+
+    const upstream = new WebSocket(`${proxy.wsUrl}/register/ws-stream`);
+    await new Promise<void>((r, j) => {
+      upstream.on("open", () => r());
+      upstream.on("error", j);
+    });
+    upstream.on("message", (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === "request") {
+        upstream.send(
+          JSON.stringify({
+            correlationId: msg.correlationId,
+            type: "stream",
+            final: false,
+            body: { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 0.5 } },
+          }),
+        );
+        upstream.send(
+          JSON.stringify({
+            correlationId: msg.correlationId,
+            type: "response",
+            final: true,
+            body: { jsonrpc: "2.0", result: { done: true }, id: msg.body.id },
+          }),
+        );
+      }
+    });
+
+    const client = new WebSocket(`${proxy.wsUrl}/mcp-ws/ws-stream`);
+    await new Promise<void>((r, j) => {
+      client.on("open", () => r());
+      client.on("error", j);
+    });
+
+    const recv: any[] = [];
+    client.on("message", (data) => recv.push(JSON.parse(data.toString())));
+
+    client.send(JSON.stringify({ jsonrpc: "2.0", method: "tools/call", id: 7 }));
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(recv.length).toBe(2);
+    expect(recv[0].method).toBe("notifications/progress");
+    expect(recv[0].params.progress).toBe(0.5);
+    expect(recv[1].result.done).toBe(true);
+    expect(recv[1].id).toBe(7);
+
+    client.close();
+    upstream.close();
+  });
 });

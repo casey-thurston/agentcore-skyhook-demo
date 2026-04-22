@@ -427,42 +427,54 @@ After registration clients connect to the `gatewayUrl` returned by `CreateGatewa
 
 ### Call Flow
 
-When an MCP client sends a request, it goes through the gateway, then the proxy, then the WebSocket tunnel to the server:
+When an MCP client sends a request, it goes through the gateway, then the proxy, then the WebSocket tunnel to the server. Every leg is a single bidirectional channel for the lifetime of the exchange:
 
 ```
-  MCP Client         AgentCore Gateway        Skyhook Proxy           MCP Server
-      │                     │                       │                      │
-      │ 1. MCP frame        │                       │                      │
-      │    over WS /        │                       │                      │
-      │    streamable HTTP  │                       │                      │
-      │    (no SSE)         │                       │                      │
-      │────────────────────▶│                       │                      │
-      │                     │                       │                      │
-      │                     │ 2. Forward to target  │                      │
-      │                     │    POST /mcp/my-server│                      │
-      │                     │    (bidirectional     │                      │
-      │                     │     HTTPS stream)     │                      │
-      │                     │──────────────────────▶│                      │
-      │                     │                       │                      │
-      │                     │                       │ 3. WS message        │
-      │                     │                       │ { correlationId,     │
-      │                     │                       │   type:"request",    │
-      │                     │                       │   body }             │
-      │                     │                       │─────────────────────▶│
-      │                     │                       │                      │
-      │                     │                       │ 4. WS response       │
-      │                     │                       │◀─────────────────────│
-      │                     │                       │                      │
-      │                     │ 5. HTTP response body │                      │
-      │                     │◀──────────────────────│                      │
-      │                     │                       │                      │
-      │ 6. MCP frame        │                       │                      │
-      │◀────────────────────│                       │                      │
+  MCP Client         AgentCore Gateway          Skyhook Proxy             MCP Server
+      │                     │                        │                         │
+      │ 1. MCP frame        │                        │                         │
+      │    (WS / streamable │                        │                         │
+      │     HTTP, no SSE)   │                        │                         │
+      │────────────────────▶│                        │                         │
+      │                     │                        │                         │
+      │                     │ 2. POST /mcp/my-server │                         │
+      │                     │    Content-Type:       │                         │
+      │                     │      application/      │                         │
+      │                     │      x-ndjson          │                         │
+      │                     │    (chunked HTTP — one │                         │
+      │                     │     JSON frame per line)│                        │
+      │                     │───────────────────────▶│                         │
+      │                     │                        │                         │
+      │                     │                        │ 3. { correlationId,     │
+      │                     │                        │     type:"request",     │
+      │                     │                        │     body } over WS      │
+      │                     │                        │────────────────────────▶│
+      │                     │                        │                         │
+      │                     │                        │ 4. stream frames        │
+      │                     │                        │    type:"stream"        │
+      │                     │                        │    final:false          │
+      │                     │                        │   (progress / sampling) │
+      │                     │                        │◀────────────────────────│
+      │                     │ ◀─NDJSON line          │                         │
+      │ ◀─MCP frame         │                        │                         │
+      │                     │                        │ 5. terminal frame       │
+      │                     │                        │    type:"response"      │
+      │                     │                        │    final:true           │
+      │                     │                        │◀────────────────────────│
+      │                     │ ◀─NDJSON line + close  │                         │
+      │ ◀─MCP frame + close │                        │                         │
 ```
+
+Each MCP exchange uses **one** chunked HTTP response on the gateway↔proxy hop and **one** WebSocket on the proxy↔server hop. Intermediate frames (progress notifications, server-initiated requests during a tool call) flow back to the client without opening a new connection or falling back to SSE.
 
 Neither the gateway nor the proxy inspects MCP payloads. `_meta.resourceUI` and other fields pass through byte-for-byte.
 
 **Latency overhead:** ~20-40ms (gateway hop + in-memory proxy correlation, no external state store).
+
+### Caveats / Honest gaps
+
+- **Mid-exchange client→server messages** (e.g. responding to a `sampling/createMessage` from the server) need a separate POST from the client's perspective — chunked HTTP is half-duplex per request. The gateway-to-proxy stream carries everything in the server→client direction; replies in the other direction ride on a fresh POST that the proxy correlates by JSON-RPC `id`.
+- **AgentCore Gateway target protocol**: AWS documents MCP targets as Streamable HTTP. We deliberately use `application/x-ndjson` (chunked, no SSE). Most HTTP clients consume this fine; if a future AgentCore Gateway version *requires* `text/event-stream` for streamed targets it would have to be re-enabled there. The proxy's WebSocket endpoint (`/mcp-ws/<serverId>`) remains a fully bidirectional alternative for clients that bypass the gateway.
 
 ### Failure Cases
 

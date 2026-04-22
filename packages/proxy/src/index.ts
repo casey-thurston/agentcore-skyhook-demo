@@ -8,21 +8,31 @@ import { URL } from "node:url";
 // Types
 // ---------------------------------------------------------------------------
 
+interface StreamChunk {
+  body: unknown;
+  final: boolean;
+  status?: number;
+  headers?: Record<string, string>;
+}
+
 interface PendingRequest {
-  resolve: (response: ProxyResponse) => void;
+  /** Called for each frame from the upstream server. final=true ends the exchange. */
+  onChunk: (chunk: StreamChunk) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
 interface ProxyMessage {
   correlationId: string;
-  type: "request" | "response" | "notification";
-  body: unknown;
-  headers?: Record<string, string>;
-  status?: number;
-}
-
-interface ProxyResponse {
+  /**
+   * - `request`: proxy → server (one per exchange)
+   * - `response`: server → proxy, terminal frame (also implies final=true unless overridden)
+   * - `stream`: server → proxy, intermediate frame (progress / mid-exchange notification tied to a request)
+   * - `notification`: server → proxy, untied (broadcast to all WS clients)
+   */
+  type: "request" | "response" | "stream" | "notification";
+  /** Marks the last frame of an exchange. Defaults to true for `response`, false for `stream`. */
+  final?: boolean;
   body: unknown;
   headers?: Record<string, string>;
   status?: number;
@@ -76,12 +86,13 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
     res.json({ status: "ok", servers: Array.from(servers.keys()) });
   });
 
-  // MCP Streamable HTTP entry point.
+  // MCP target endpoint — accepts a single client request and streams every
+  // frame of the resulting exchange back as chunked NDJSON
+  // (Content-Type: application/x-ndjson). Each line is one JSON-RPC message:
+  // intermediate progress notifications, server-initiated requests, and the
+  // final response are all delivered over the same response body.
   //
-  // AgentCore Gateway (or any MCP client) posts a JSON-RPC message here.
-  // The response is returned as a streamed JSON body (chunked HTTP) rather
-  // than SSE — AgentCore Gateway will in turn stream it to its own clients
-  // over its bidirectional MCP transport.
+  // No SSE: the framing is just chunked HTTP with one JSON document per line.
   app.post("/mcp/:serverId", (req, res) => {
     const { serverId } = req.params;
     const conn = servers.get(serverId);
@@ -112,11 +123,36 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
       },
     };
 
-    const timer = setTimeout(() => {
+    let headersWritten = false;
+    const writeHeadersOnce = (status?: number, headers?: Record<string, string>) => {
+      if (headersWritten || res.headersSent) return;
+      headersWritten = true;
+      res.status(status ?? 200);
+      if (headers) {
+        for (const [k, v] of Object.entries(headers)) {
+          res.setHeader(k, v);
+        }
+      }
+      res.setHeader("Content-Type", "application/x-ndjson");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
       pending.delete(correlationId);
       serverPending.get(serverId)?.delete(correlationId);
-      if (!res.headersSent) {
-        res.status(504).json({ error: "Request timeout", correlationId });
+    };
+
+    const timer = setTimeout(() => {
+      cleanup();
+      writeHeadersOnce(504);
+      if (!res.writableEnded) {
+        try {
+          res.write(JSON.stringify({ error: "Request timeout", correlationId }) + "\n");
+        } catch { /* ignore */ }
+        res.end();
       }
     }, requestTimeoutMs);
 
@@ -125,27 +161,37 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
     }
     serverPending.get(serverId)!.add(correlationId);
 
+    const closedByClient = () => {
+      // If the client hangs up, drop the pending entry so we stop accumulating.
+      cleanup();
+    };
+    res.on("close", closedByClient);
+
     pending.set(correlationId, {
-      resolve: (response) => {
-        clearTimeout(timer);
-        pending.delete(correlationId);
-        serverPending.get(serverId)?.delete(correlationId);
-        if (!res.headersSent) {
-          const status = response.status ?? 200;
-          if (response.headers) {
-            for (const [k, v] of Object.entries(response.headers)) {
-              res.setHeader(k, v);
-            }
+      onChunk: (chunk) => {
+        writeHeadersOnce(chunk.status, chunk.headers);
+        if (!res.writableEnded) {
+          try {
+            res.write(JSON.stringify(chunk.body) + "\n");
+          } catch {
+            cleanup();
+            return;
           }
-          res.status(status).json(response.body);
+        }
+        if (chunk.final) {
+          cleanup();
+          if (!res.writableEnded) res.end();
         }
       },
       reject: (err) => {
-        clearTimeout(timer);
-        pending.delete(correlationId);
-        serverPending.get(serverId)?.delete(correlationId);
-        if (!res.headersSent) {
+        cleanup();
+        if (!headersWritten && !res.headersSent) {
           res.status(502).json({ error: err.message, correlationId });
+        } else if (!res.writableEnded) {
+          try {
+            res.write(JSON.stringify({ error: err.message, correlationId }) + "\n");
+          } catch { /* ignore */ }
+          res.end();
         }
       },
       timer,
@@ -154,9 +200,7 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
     try {
       conn.ws.send(JSON.stringify(msg));
     } catch {
-      clearTimeout(timer);
-      pending.delete(correlationId);
-      serverPending.get(serverId)?.delete(correlationId);
+      cleanup();
       if (!res.headersSent) {
         res
           .status(502)
@@ -261,17 +305,19 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
         return;
       }
 
-      if (msg.type === "response") {
+      if (msg.type === "response" || msg.type === "stream") {
         const p = pending.get(msg.correlationId);
         if (p) {
-          p.resolve({
+          const final = msg.final ?? msg.type === "response";
+          p.onChunk({
             body: msg.body,
+            final,
             headers: msg.headers,
             status: msg.status,
           });
         }
       } else if (msg.type === "notification") {
-        // Fan out to any connected client WebSockets for this server.
+        // Untied notification — fan out to attached client WebSockets.
         const payload = JSON.stringify(msg.body);
         for (const clientWs of conn.clientSockets) {
           if (clientWs.readyState === WebSocket.OPEN) {
@@ -337,14 +383,20 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
       }
 
       // Each client frame is a single JSON-RPC message. Forward it to the
-      // upstream server and stream the response back on the same socket.
+      // upstream server; every frame the server emits for this exchange is
+      // streamed back over the same WebSocket.
       const correlationId = randomUUID();
       clientCorrelations.add(correlationId);
 
-      const timer = setTimeout(() => {
+      const cleanup = () => {
+        clearTimeout(timer);
         pending.delete(correlationId);
         serverPending.get(serverId)?.delete(correlationId);
         clientCorrelations.delete(correlationId);
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
@@ -360,20 +412,14 @@ export function createProxy(opts?: ProxyOptions): SkyhookProxy {
       serverPending.get(serverId)!.add(correlationId);
 
       pending.set(correlationId, {
-        resolve: (response) => {
-          clearTimeout(timer);
-          pending.delete(correlationId);
-          serverPending.get(serverId)?.delete(correlationId);
-          clientCorrelations.delete(correlationId);
+        onChunk: (chunk) => {
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(response.body));
+            ws.send(JSON.stringify(chunk.body));
           }
+          if (chunk.final) cleanup();
         },
         reject: (err) => {
-          clearTimeout(timer);
-          pending.delete(correlationId);
-          serverPending.get(serverId)?.delete(correlationId);
-          clientCorrelations.delete(correlationId);
+          cleanup();
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
               JSON.stringify({

@@ -87,23 +87,43 @@ export class SkyhookTransport implements Transport {
       throw new Error("Not connected to Skyhook proxy");
     }
 
-    // Find the correlationId for this response.
-    // Prefer relatedRequestId (set by MCP Server for responses to requests),
-    // then fall back to message.id (for direct responses).
-    const requestId = options?.relatedRequestId ?? ("id" in message ? message.id : undefined);
+    const m = message as Record<string, unknown>;
+    const isResponse = "result" in m || "error" in m;
 
-    if (requestId !== undefined) {
-      const correlationId = this.correlationMap.get(requestId);
+    // Find the correlationId for this exchange.
+    // For final responses (matched by message.id), or progress notifications
+    // tied via TransportSendOptions.relatedRequestId, we route on the same
+    // proxy correlationId so the proxy can stream multiple frames per request.
+    const relatedId =
+      options?.relatedRequestId ??
+      (isResponse && "id" in m ? (m.id as string | number) : undefined);
+
+    if (relatedId !== undefined) {
+      const correlationId = this.correlationMap.get(relatedId);
       if (correlationId) {
-        this.ws.send(
-          JSON.stringify({
-            correlationId,
-            type: "response",
-            body: message,
-          }),
-        );
-        // Clean up — one response per request
-        this.correlationMap.delete(requestId);
+        if (isResponse) {
+          // Terminal frame — proxy will end the streamed HTTP response.
+          this.ws.send(
+            JSON.stringify({
+              correlationId,
+              type: "response",
+              final: true,
+              body: message,
+            }),
+          );
+          this.correlationMap.delete(relatedId);
+        } else {
+          // Intermediate frame (progress notification, server-initiated
+          // request mid-exchange, etc.) — proxy keeps the response open.
+          this.ws.send(
+            JSON.stringify({
+              correlationId,
+              type: "stream",
+              final: false,
+              body: message,
+            }),
+          );
+        }
         return;
       }
     }
